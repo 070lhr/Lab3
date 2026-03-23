@@ -1,157 +1,181 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.font_manager import FontProperties
+import matplotlib.patches as patches
 
-# ================= 1. 学术图表环境配置 =================
+# ================= 1. 环境配置 =================
 plt.rcParams['axes.unicode_minus'] = False  
-plt.rcParams['mathtext.fontset'] = 'stix'  # 顶刊公式字体
+plt.rcParams['mathtext.fontset'] = 'stix'
 try:
-    font = FontProperties(fname="MSYH.TTC", size=13)
-    title_font = FontProperties(fname="MSYH.TTC", size=15)
+    font = FontProperties(fname="MSYH.TTC", size=11)
+    title_font = FontProperties(fname="MSYH.TTC", size=14)
 except:
     font = title_font = None
 
-# ================= 2. 提取自 CICIOT2023 的真实分布参数 =================
-# 单位: pps (Packets Per Second)
-LAMBDA_BENIGN = 500       # 合法物联网传感器背景流量
-LAMBDA_FLOOD = 85000      # DDoS-UDP_Flood 平均包率
-LAMBDA_STEALTH = 4500     # DDoS-HTTP_Flood (拟态攻击) 平均包率
-
-# ================= 3. 物联网边缘网关物理建模 (核心创新) =================
-# 模拟一台典型 SDN 边缘交换机的处理能力
-MU_MAX = 100000.0         # 网关最大线速处理能力 (pps)
-MEM_MAX = 8192.0          # 最大流表/状态内存 (MB)
-
-def calculate_iot_physical_cost(lambda_traffic, strategy_idx):
-    """
-    根据 M/M/1 排队论和网关物理参数计算真实成本
-    strategy_idx: 0(流表阻断), 1(动态限速), 2(深度清洗)
-    """
-    # 不同策略的包处理速率 (mu)
-    mu_rates = [MU_MAX * 0.95, MU_MAX * 0.6, MU_MAX * 0.15] 
-    # 不同策略的单包内存消耗权重
-    mem_weights = [0.001, 0.05, 0.2] 
-    
-    mu_i = mu_rates[strategy_idx]
-    k_i = mem_weights[strategy_idx]
-    
-    # 1. CPU排队延迟惩罚 (M/M/1 模型): traffic / (mu - traffic)
-    # 如果流量超过了处理能力，CPU惩罚极其巨大
-    utilization = lambda_traffic / mu_i
-    if utilization >= 0.99:
-        cpu_cost = 500.0 # 模拟网关宕机边缘的极高惩罚
-    else:
-        cpu_cost = utilization / (1 - utilization) * 10 
+# ================= 2. 底层物联网节点类定义 =================
+class IoTNode:
+    def __init__(self, node_id, x, y, node_type):
+        self.node_id = node_id
+        self.x = x
+        self.y = y
+        self.node_type = node_type  # 'benign'(合法), 'attacker'(DDoS攻击者), 'selfish'(自私节点)
+        self.trust_value = 1.0      # 初始信任值最高为 1.0
+        self.is_isolated = False    # 是否被网关切断连接
         
-    # 2. 内存状态消耗 (模拟维持流表和连接状态)
-    mem_cost = (k_i * lambda_traffic) / MEM_MAX * 100
-    
-    # 综合物理成本
-    return 0.6 * cpu_cost + 0.4 * mem_cost
-
-def project_to_simplex(v):
-    u = np.sort(v)[::-1]
-    cssv = np.cumsum(u)
-    rho = np.nonzero(u * np.arange(1, len(u) + 1) > (cssv - 1))[0][-1]
-    theta = (cssv[rho] - 1) / (rho + 1.0)
-    return np.maximum(v - theta, 0)
-
-# ================= 4. 融合物理参数的博弈仿真 =================
-def run_physical_iot_simulation():
-    total_time = 300
-    
-    # --- 步骤 1: 根据 CICIOT2023 生成带突发特征的流量 ---
-    traffic_pps = np.zeros(total_time)
-    current_state = 0 # 0: 正常+隐蔽探测, 1: 泛洪爆发
-    
-    for t in range(total_time):
-        # 状态机模拟突发
-        if current_state == 0 and np.random.rand() < 0.08: current_state = 1
-        elif current_state == 1 and np.random.rand() < 0.15: current_state = 0
-        
-        # 泊松采样 (CICIOT2023参数)
-        if current_state == 0:
-            traffic_pps[t] = np.random.poisson(LAMBDA_BENIGN) + np.random.poisson(LAMBDA_STEALTH)
-        else:
-            traffic_pps[t] = np.random.poisson(LAMBDA_BENIGN) + np.random.poisson(LAMBDA_FLOOD)
+    def generate_traffic(self):
+        """模拟单个节点在当前轮次产生的数据量 (bits)"""
+        if self.is_isolated:
+            return 0
             
-    # --- 步骤 2: 多方案动态博弈求解 ---
-    utility_proposed = np.zeros(total_time)
-    utility_rl_sdn = np.zeros(total_time)      # 对标 CCF A类 强化学习方案
-    utility_static_game = np.zeros(total_time) # 对标 Saiyed 等人 静态博弈方案
-    
-    p_proposed = np.array([0.33, 0.33, 0.34])
-    p_rl = np.array([0.33, 0.33, 0.34])
-    p_static = np.array([0.33, 0.33, 0.34])
-    a = 0.5
-    
-    for t in range(total_time):
-        cur_lambda = traffic_pps[t]
-        
-        # 动态物理成本矩阵 C 
-        C = np.array([calculate_iot_physical_cost(cur_lambda, 0),
-                      calculate_iot_physical_cost(cur_lambda, 1),
-                      calculate_iot_physical_cost(cur_lambda, 2)])
-        
-        # 收益与破坏力同样受流量绝对值驱动
-        G_F, G_S = cur_lambda * 0.05, cur_lambda * 0.01
-        B_F = np.array([cur_lambda * 0.04, cur_lambda * 0.03, cur_lambda * 0.045])
-        B_S = np.array([cur_lambda * 0.005, cur_lambda * 0.008, cur_lambda * 0.009])
-        L_F = np.array([50, 30, 60])
-        L_S = np.array([5, 20, 50])
-        
-        # --- 方案1: 提出的模型 (动态投影梯度下降 PGD) ---
-        for _ in range(5):
-            grad_p = a * B_F + (1 - a) * B_S - C
-            grad_a = np.sum(p_proposed * ((G_F - G_S) - (L_F - L_S)))
-            p_proposed = project_to_simplex(p_proposed + 0.01 * grad_p)
-            a = np.clip(a + 0.01 * grad_a, 0.0, 1.0)
-        utility_proposed[t] = np.sum(p_proposed * (a * B_F + (1 - a) * B_S - C))
-        
-        # --- 方案2: RL-SDN (强化学习，存在收敛延迟) ---
-        p_rl = 0.85 * p_rl + 0.15 * p_proposed # 模拟滞后性
-        if np.random.rand() < 0.1: p_rl = project_to_simplex(p_rl + np.random.randn(3)*0.1)
-        utility_rl_sdn[t] = np.sum(p_rl * (a * B_F + (1 - a) * B_S - C))
-        
-        # --- 方案3: 静态博弈 (Static Game, Saiyed等人的弱化版) ---
-        if t % 30 == 0: # 假设边缘节点算力有限，每30秒才能重新求解一次纳什均衡
-            p_static = np.copy(p_proposed) 
-        utility_static_game[t] = np.sum(p_static * (a * B_F + (1 - a) * B_S - C))
+        if self.node_type == 'benign':
+            return np.random.poisson(200) # 正常节点每次产生约 200 bits
+        elif self.node_type == 'attacker':
+            return np.random.poisson(85000) # 攻击节点疯狂洪泛
+        elif self.node_type == 'selfish':
+            # 自私节点：偶尔发大量数据抢占信道，但不完全像 DDoS
+            return np.random.poisson(4000) if np.random.rand() > 0.5 else 0
 
-    # ================= 5. IEEE TNSM 级别可视化 =================
-    fig, ax1 = plt.subplots(figsize=(10, 6))
-    time_axis = np.arange(total_time)
-    
-    # 绘制系统效用对比
-    ax1.plot(time_axis, np.cumsum(utility_proposed), label='本文模型 (基于PGD的动态物理资源博弈)', 
-             color='#8B0000', linewidth=2.5) # 深红
-    ax1.plot(time_axis, np.cumsum(utility_rl_sdn), label='RL-SDN (CCF A类 强化学习防御基线)', 
-             color='#00008B', linestyle='--', linewidth=2.5) # 深蓝
-    ax1.plot(time_axis, np.cumsum(utility_static_game), label='Static-Game (对标传统静态纳什均衡求解)', 
-             color='#006400', linestyle='-.', linewidth=2.5) # 深绿
-    
-    # 双 Y 轴设计：将 CICIOT2023 的真实流量作为背景阴影展示，极大地提升专业感
-    ax2 = ax1.twinx()
-    ax2.fill_between(time_axis, traffic_pps, color='gray', alpha=0.15, label='CICIOT2023 背景攻击流量 (右轴)')
-    ax2.set_ylabel('网关实时到达包率 (Packets/Sec)', fontproperties=font, color='gray')
-    ax2.tick_params(axis='y', labelcolor='gray')
+    def update_trust(self, penalty):
+        """更新信任值"""
+        self.trust_value = max(0.0, self.trust_value - penalty)
 
-    ax1.set_title('复杂物联网边缘场景下的系统累积安全效用评估', fontproperties=title_font)
-    ax1.set_xlabel('博弈仿真时间 (Seconds)', fontproperties=font)
-    ax1.set_ylabel('网关综合效用累计值 ($U_D$)', fontproperties=font)
-    
-    ax1.grid(True, linestyle='--', linewidth=0.8, alpha=0.5)
-    ax1.tick_params(direction='in', length=5, width=1, labelsize=11)
-    for spine in ax1.spines.values(): spine.set_linewidth(1.2)
+# ================= 3. 边缘网关与博弈防御类 =================
+class EdgeGateway:
+    def __init__(self):
+        # 防守策略概率: [流表阻断, 动态限速, 深度清洗]
+        self.p = np.array([0.33, 0.33, 0.34])
+        # Saiyed 论文中提到的博弈论成本二次函数预设参数
+        self.eta_T = -3e-2
+        self.gamma_T = 4.0
 
-    # 合并两个图例
-    lines_1, labels_1 = ax1.get_legend_handles_labels()
-    lines_2, labels_2 = ax2.get_legend_handles_labels()
-    ax1.legend(lines_1 + lines_2, labels_1 + labels_2, loc='upper left', frameon=True, edgecolor='black', prop=font)
+    def project_to_simplex(self, v):
+        u = np.sort(v)[::-1]
+        cssv = np.cumsum(u)
+        rho = np.nonzero(u * np.arange(1, len(u) + 1) > (cssv - 1))[0][-1]
+        theta = (cssv[rho] - 1) / (rho + 1.0)
+        return np.maximum(v - theta, 0)
+
+    def calculate_game_theory_defense(self, total_traffic):
+        """执行博弈论调度计算"""
+        # 这里的计算将底层拓扑传上来的总流量代入效用函数
+        C = np.array([5.0, 15.0, 20.0 + total_traffic * 0.001])
+        B_F = np.array([total_traffic * 0.9, total_traffic * 0.5, total_traffic * 0.8])
+        B_S = np.array([10, 80, 120])
+        
+        # 梯度更新 (简化版)
+        a = 0.5  # 假设攻击方的某种隐蔽概率
+        grad_p = a * B_F + (1 - a) * B_S - C
+        self.p = self.project_to_simplex(self.p + 0.05 * grad_p)
+        
+        # 返回当前最优策略的索引 (0, 1, 或 2)
+        return np.argmax(self.p)
+
+# ================= 4. 空间拓扑与离散事件仿真主循环 =================
+def run_topological_simulation():
+    # --- 参数设定 (完全对标论文) ---
+    AREA_SIZE = 200        # 200 x 200 平方米
+    NUM_NODES = 100        # 100 个节点
+    COMM_RADIUS = 20       # 通信半径 (设为20米以便于网关覆盖，原设2米易造成网络孤岛)
+    LINK_CAPACITY = 800000 # 链路总容量 C
+    ROUNDS = 100           # 实验总轮次 T_n
     
+    # --- 实例化网络节点 ---
+    nodes = []
+    for i in range(NUM_NODES):
+        x, y = np.random.uniform(0, AREA_SIZE, 2)
+        # 设定网络中有 70个正常节点, 20个DDoS攻击者, 10个自私节点
+        if i < 70: n_type = 'benign'
+        elif i < 90: n_type = 'attacker'
+        else: n_type = 'selfish'
+        nodes.append(IoTNode(i, x, y, n_type))
+        
+    gateway = EdgeGateway()
+    
+    # 数据记录
+    history_avg_trust = []
+    history_gateway_load = []
+    history_strategy = []
+    
+    print(f"开始 {ROUNDS} 轮的离散事件拓扑仿真...")
+    
+    for round_idx in range(ROUNDS):
+        total_traffic = 0
+        node_traffic_dict = {}
+        
+        # 1. 数据收集阶段
+        for node in nodes:
+            traffic = node.generate_traffic()
+            total_traffic += traffic
+            node_traffic_dict[node.node_id] = traffic
+            
+        # 2. 网关博弈论防御决策阶段
+        best_strategy = gateway.calculate_game_theory_defense(total_traffic)
+        history_strategy.append(best_strategy)
+        
+        # 3. 动态节点行为与信任惩罚阶段
+        active_trusts = [n.trust_value for n in nodes if not n.is_isolated]
+        avg_trust = np.mean(active_trusts) if active_trusts else 0
+        history_avg_trust.append(avg_trust)
+        
+        for node in nodes:
+            if node.is_isolated: continue
+            
+            # 引入二次函数成本计算惩罚 (利用 eta_T 和 gamma_T)
+            # 流量异常大的节点将受到严厉惩罚
+            deviation = node_traffic_dict[node.node_id] - 200
+            if deviation > 1000:
+                penalty = abs(gateway.eta_T * (deviation ** 2) + gateway.gamma_T * deviation) * 1e-6
+                node.update_trust(penalty)
+                
+            # 【核心机制】信任值低于网络平均水平，直接降级隔离
+            if node.trust_value < avg_trust * 0.8:
+                node.is_isolated = True
+                
+        # 记录链路负载率
+        load_ratio = min(total_traffic / LINK_CAPACITY, 1.0)
+        history_gateway_load.append(load_ratio * 100)
+
+    print("仿真完成！正在生成拓扑与态势图表...")
+
+    # ================= 5. 可视化输出 =================
+    fig = plt.figure(figsize=(15, 5))
+    
+    # 子图1：物理空间拓扑与节点状态图
+    ax1 = fig.add_subplot(131)
+    ax1.set_xlim(0, AREA_SIZE)
+    ax1.set_ylim(0, AREA_SIZE)
+    ax1.set_title(f'100节点物联网空间拓扑状态 (第 {ROUNDS} 轮)', fontproperties=title_font)
+    
+    for node in nodes:
+        color = 'green' if node.node_type == 'benign' else ('red' if node.node_type == 'attacker' else 'orange')
+        marker = 'x' if node.is_isolated else 'o'
+        alpha = 0.3 if node.is_isolated else 1.0
+        size = 20 if node.is_isolated else 50
+        ax1.scatter(node.x, node.y, c=color, marker=marker, s=size, alpha=alpha)
+        
+    ax1.text(10, 190, 'Green: Benign (合法)\nRed: Attacker (攻击)\nOrange: Selfish (自私)\nX: Isolated (被隔离)', 
+             bbox=dict(facecolor='white', alpha=0.8), fontsize=8)
+    ax1.grid(True, linestyle=':', alpha=0.6)
+
+    # 子图2：全网平均信任值衰减与动态降级过程
+    ax2 = fig.add_subplot(132)
+    ax2.plot(range(ROUNDS), history_avg_trust, color='purple', linewidth=2)
+    ax2.set_title('动态节点行为：全网平均信任值演变', fontproperties=title_font)
+    ax2.set_xlabel('仿真轮次 ($T_n$)', fontproperties=font)
+    ax2.set_ylabel('平均信任值 (Trust Value)', fontproperties=font)
+    ax2.grid(True, linestyle='--', alpha=0.6)
+
+    # 子图3：网关链路负载率与防御动作反馈
+    ax3 = fig.add_subplot(133)
+    ax3.plot(range(ROUNDS), history_gateway_load, color='darkred', linewidth=2, label='链路负载率(%)')
+    ax3.set_title('防御介入后的网关负载演变', fontproperties=title_font)
+    ax3.set_xlabel('仿真轮次 ($T_n$)', fontproperties=font)
+    ax3.set_ylabel('负载占用百分比 (%)', fontproperties=font)
+    ax3.grid(True, linestyle='--', alpha=0.6)
+
     plt.tight_layout()
-    plt.savefig('fig_5_top_tier_comparison.png', dpi=600, bbox_inches='tight')
-    print("基于物联网物理模型与 CICIOT2023 参数的顶刊级对比图渲染完成！")
+    plt.savefig('fig_topological_simulation.png', dpi=600, bbox_inches='tight')
+    print("图表渲染完成：fig_topological_simulation.png")
 
 if __name__ == "__main__":
-    run_physical_iot_simulation()
+    run_topological_simulation()
